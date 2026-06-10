@@ -11,23 +11,30 @@ quick-and-dirty "what does this distribution look like" checks — real/paper
 plots happen elsewhere.
 
 Group name on the left, graphics (histogram over box-&-whisker) on the right,
-all on a shared fixed x-axis; the full numeric summary is a plain list below:
+all on a shared fixed x-axis; the full numeric summary is a column-aligned list
+below. The histogram is 2 character rows tall by default (16 levels of vertical
+resolution, linear — bar heights stay proportional), which makes low-count tail
+bins visible without distorting anything; `--rows 1` drops to a compact single
+row.
 
 ```
-coherence (0-100)
+200 samples each
 
-Gemma           ▂   ▂     ▂ ▂ ▂   ▂▂▂▂▂▄▄▂▂█▄▄▂▂▄   ▄      <- histogram (sparkline)
-                ├───────────────────[====┃===]──────┤      <- box & whisker
-Olmo   ▄▂▂▂▆▂▄▄▂▆▄▄▄█▄▂
-       ├────[===┃==]──┤
-Qwen                                     ▁▁█▇▅▅▄▇▁
-                                         ├─[=┃]──┤
-       └──────────┴──────────┴───────────┴──────────┴      <- shared axis (once)
-       44         57.7       71.4        86.3     100
+Normal                            ▃ ▂█
+                     ▁  ▁▂▁▃▄▆▆█▆██████▄█▅▁▂▅ ▃ ▁▁ ▁         <- histogram (2 rows)
+                     ├──────────[==┃==]───────────┤          <- box & whisker
+Exponential  █
+             █▃▆█▅▅▄▃▄▄▃▃▁▂▁▁▂  ▁▁ ▁      ▁
+             ├─[==┃===]─────────────────────┤
+Uniform       ▃ ▁ ▄▃ ▁   ▃   ▆   ▁▃ ▁▃  ▁█        ▁ ▃▁▁ ▁▃▄
+             ▅█▇█▄██▅█▇▇▇█▄▄▇█▇▅▅██▇██▇▇██▅▅▇▅▂▇▄▅█▄███▅███
+             ├──────────[===========┃==========]──────────┤
+             └──────────┴──────────┴───────────┴──────────┴  <- shared axis (once)
+             0.16       24.6       49          75.6     100
 
-Gemma: n=30  min 55  q1 80.2  med 86.5  q3 90.8  max 100  mean 84.1  sd 10.5
-Olmo:  n=30  min 44  q1 50.2  med 55  q3 59  max 63  mean 54.6  sd 5.51
-Qwen:  n=30  min 86  q1 89.2  med 91  q3 93  max 96  mean 91.1  sd 2.52
+Normal:      n=200  min 18.6  q1 41.5  med 49.9  q3 56  max 82.6  mean 49.5  sd 11.2
+Exponential: n=200  min 0.16  q1 4.31  med 10.8  q3 21  max 69.9  mean 14.5  sd 13.6
+Uniform:     n=200  min 1.22  q1 24.6  med 50.1  q3 75  max  100  mean 50.2  sd 29.5
 ```
 
 Box & whisker reads `├` min · `[` q1 · `┃` median · `]` q3 · `┤` max. Stacking
@@ -82,6 +89,7 @@ groups share the **same fixed x-range** so the panels are directly comparable.
 ## Flags
 
 - `--width N` — plot width in characters (default 46)
+- `--rows N` — histogram height in character rows (default 2; `1` = compact)
 - `--title TEXT` — title printed once above the panels
 - `--summary-only` — print just the numeric summary lines, no plot
 

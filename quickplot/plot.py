@@ -7,16 +7,19 @@
 quickplot — numbers in, honest unicode plot out.
 
 The contract: this script is the ONLY thing that turns data into a picture.
-For every group it prints, on a shared fixed x-axis:
+Name on the left, graphics (histogram over box plot) on the right, shared axis:
 
-  Gemma   n=30  min 55  q1 80.2  med 86.5  q3 90.8  max 100  mean 84.1  sd 10.5
-                        ▂  ▂▆   ▂▂█▄█▆▂▄▄ ▄   ▄ ▂      <- histogram (sparkline)
-    ├─────────▐▒█▒▒▌───────┤                          <- box & whisker
-    └────┴────┴────┴────┴───  44 … 102                <- shared axis
+  Normal                   ▃ ▂█
+                ▁ ▁▂▃▄▆█▆██████▄▅▁▂ ▃ ▁          <- histogram (2 rows, linear)
+                ├──────[==┃==]──────┤            <- box & whisker
+                └────┴────┴────┴────┴            <- shared axis (once, at bottom)
+                18.6     ...           82.6
+  Normal: n=200  min 18.6  q1 41.5  med 49.9 ...  <- aligned numeric summary below
 
-The full seven-number summary + n is printed as TEXT — the plot is only a
-visual aid, so nothing can be hidden, rounded away, or editorialised. If a
-value can't be parsed it is COUNTED and reported, never silently dropped.
+The full seven-number summary + n is printed as TEXT, columns right-aligned —
+the plot is only a visual aid, so nothing can be hidden, rounded away, or
+editorialised. If a value can't be parsed it is COUNTED and reported, never
+silently dropped.
 
 Input (file arg or stdin), auto-detected:
   1. JSON object   {"Gemma":[..], "Olmo":[..]}  -> one panel per key
@@ -32,6 +35,7 @@ Usage:
   echo '{"a":[1,2,3],"b":[2,2,9]}' | ./plot.py --title coherence
 Flags:
   --width N       plot width in chars (default 46)
+  --rows N        histogram height in character rows (default 2; 1 = compact)
   --title TEXT    title printed once above the panels
   --summary-only  print just the numeric summary lines, no plot
 """
@@ -128,10 +132,17 @@ def col(x, lo, hi, W):
     return W // 2 if hi == lo else int(round((x - lo) / (hi - lo) * (W - 1)))
 
 
-def spark_row(vals, lo, hi, W):
+def spark_rows(vals, lo, hi, W, rows=2):
+    # `rows` stacked sparkline rows => rows*8 levels of vertical resolution,
+    # linear (bar heights stay proportional). Returns lines top-to-bottom.
     counts, _ = np.histogram(vals, bins=W, range=(lo, hi))
     cmax = counts.max() or 1
-    return "".join(SPARK[min(8, int(round(c / cmax * 8)))] for c in counts)
+    levels = rows * 8
+    heights = [min(levels, int(round(c / cmax * levels))) for c in counts]
+    grid = []
+    for ri in range(rows):  # ri=0 is the bottom row
+        grid.append("".join(SPARK[max(0, min(8, h - 8 * ri))] for h in heights))
+    return list(reversed(grid))  # top row first
 
 
 def box_row(vals, lo, hi, W):
@@ -168,24 +179,61 @@ def axis_rows(lo, hi, W, nticks=5):
     return "└" + "".join(line)[1:], "".join(labels).rstrip()
 
 
-def stats_str(vals, bad):
-    n = len(vals)
-    tag = f"  ⚠ {bad} unparseable" if bad else ""
-    if n == 0:
-        return f"n=0 (no usable numbers){tag}"
-    q1, med, q3 = np.percentile(vals, [25, 50, 75])
-    std = vals.std(ddof=1) if n > 1 else 0.0
-    return (
-        f"n={n}  min {fmt(vals.min())}  q1 {fmt(q1)}  med {fmt(med)}"
-        f"  q3 {fmt(q3)}  max {fmt(vals.max())}  mean {fmt(vals.mean())}"
-        f"  sd {fmt(std)}{tag}"
-    )
+SUMMARY_COLS = ["n", "min", "q1", "med", "q3", "max", "mean", "sd"]
+
+
+def summary_block(groups, gut):
+    # One line per group, numeric columns right-aligned to a shared width so
+    # they line up vertically regardless of how many digits each value has.
+    rows = []
+    for label, vals, bad in groups:
+        if len(vals) == 0:
+            rows.append((label, None, bad))
+            continue
+        n = len(vals)
+        q1, med, q3 = np.percentile(vals, [25, 50, 75])
+        std = vals.std(ddof=1) if n > 1 else 0.0
+        fields = {
+            "n": str(n),
+            "min": fmt(vals.min()),
+            "q1": fmt(q1),
+            "med": fmt(med),
+            "q3": fmt(q3),
+            "max": fmt(vals.max()),
+            "mean": fmt(vals.mean()),
+            "sd": fmt(std),
+        }
+        rows.append((label, fields, bad))
+    width = {
+        k: max((len(f[k]) for _, f, _ in rows if f), default=1) for k in SUMMARY_COLS
+    }
+    lines = []
+    for label, fields, bad in rows:
+        prefix = (label + ":").ljust(gut + 1)
+        tag = f"  ⚠ {bad} unparseable" if bad else ""
+        if fields is None:
+            lines.append(f"{prefix} n=0 (no usable numbers){tag}")
+            continue
+        cells = [
+            f"{k}={fields[k]:>{width[k]}}"
+            if k == "n"
+            else f"{k} {fields[k]:>{width[k]}}"
+            for k in SUMMARY_COLS
+        ]
+        lines.append(prefix + " " + "  ".join(cells) + tag)
+    return lines
 
 
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("file", nargs="?")
     ap.add_argument("--width", type=int, default=46)
+    ap.add_argument(
+        "--rows",
+        type=int,
+        default=2,
+        help="histogram height in character rows (default 2)",
+    )
     ap.add_argument("--title", default="")
     ap.add_argument("--summary-only", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
@@ -217,7 +265,10 @@ def main():
     if not args.summary_only and lo is not None:
         for label, vals, bad in groups:
             if len(vals):
-                print(f"{label.ljust(gut)}  {spark_row(vals, lo, hi, W)}")
+                spark = spark_rows(vals, lo, hi, W, args.rows)
+                print(f"{label.ljust(gut)}  {spark[0]}")
+                for extra in spark[1:]:
+                    print(f"{indent}{extra}")
                 print(f"{indent}{box_row(vals, lo, hi, W)}")
             else:
                 print(f"{label.ljust(gut)}  (no data)")
@@ -226,9 +277,9 @@ def main():
         print(indent + labels)
         print()
 
-    # Summary stats as a plain list of lines below the graphics.
-    for label, vals, bad in groups:
-        print(f"{(label + ':').ljust(gut + 1)} {stats_str(vals, bad)}")
+    # Summary stats as a plain list of lines below the graphics, columns aligned.
+    for ln in summary_block(groups, gut):
+        print(ln)
     print()
 
 
