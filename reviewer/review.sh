@@ -8,7 +8,7 @@
 # but it CANNOT edit anything. It reports findings only.
 #
 # Usage:
-#   review.sh [--spec PATH_OR_URL]... [scope] [options]
+#   review.sh [--spec PATH_OR_URL]... [scope] [options] ["focus text"]
 #
 # Scope (pick at most one; default = auto):
 #   (default/auto)      Working tree vs merge-base with the base branch, i.e.
@@ -30,6 +30,7 @@
 #   --model MODEL       codex model override (default: codex's configured model).
 #   -C, --cd DIR        Repo directory to review in (default: current dir).
 #   --focus TEXT        Extra reviewer instructions appended to the prompt.
+#                       Equivalent: pass the text as trailing free-text args.
 #   --dry-run           Print the assembled prompt and the codex command; run
 #                       nothing (no API cost). Use to inspect before spending.
 #   -h, --help          This help.
@@ -55,6 +56,7 @@ FOCUS=""
 DRY_RUN=0
 SPECS=()
 SPEC_TMPFILES=()
+POSITIONAL=()
 
 # Clean up any verbatim-fetched spec temp files (they may hold private issue/PR
 # text). The EXIT trap covers normal exits, errors and dry-run; the signal trap
@@ -82,9 +84,17 @@ while [ $# -gt 0 ]; do
     --focus)       [ $# -ge 2 ] || die "--focus needs text"; FOCUS="$2"; shift 2 ;;
     --dry-run)     DRY_RUN=1; shift ;;
     -h|--help)     awk 'NR<3{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
-    *)             die "unknown argument: $1 (see --help)" ;;
+    -*)            die "unknown option: $1 (see --help)" ;;
+    *)             POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+# Free-text (non-flag) arguments become the reviewer's focus, so a slash-command
+# prompt is forwarded straight to codex, e.g.  review.sh "scrutinise the retry
+# logic". An explicit --focus wins if both are supplied.
+if [ -z "$FOCUS" ] && [ "${#POSITIONAL[@]}" -gt 0 ]; then
+  FOCUS="${POSITIONAL[*]}"
+fi
 
 # ---- resolve repo -----------------------------------------------------------
 command -v git >/dev/null 2>&1 || die "git not found on PATH"
@@ -134,6 +144,19 @@ untracked_diff() {
   done
 }
 
+diffstat() {
+  # Count added/removed CONTENT lines in a unified diff read from stdin. Counts
+  # only inside hunks, so +++/--- file headers are never miscounted. Prints
+  # "<added> <removed>".
+  awk '
+    /^@@/ { inhunk=1; next }
+    /^(diff |index |--- |\+\+\+ |Binary |new file|deleted file|rename |similarity |old mode|new mode|GIT binary)/ { inhunk=0; next }
+    inhunk && /^\+/ { add++ }
+    inhunk && /^-/  { del++ }
+    END { printf "%d %d\n", add+0, del+0 }
+  '
+}
+
 # ---- compute the diff -------------------------------------------------------
 [ -n "$BASE" ] || BASE=$(detect_base)
 
@@ -163,6 +186,31 @@ case "$MODE" in
 esac
 
 is_blank "$DIFF" && die "no changes to review for the selected scope"
+
+# ---- kickoff banner ---------------------------------------------------------
+# A little context so you can see exactly what's being handed to codex.
+REPORT="${TMPDIR:-/tmp}/reviewer-report.$$.md"
+HEAD_SHA=$(git_root rev-parse --short HEAD 2>/dev/null || echo '?')
+CUR_BRANCH=$(git_root rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+read -r N_ADD N_DEL < <(printf '%s' "$DIFF" | diffstat)
+N_FILES=$(printf '%s\n' "$DIFF" | grep -cE '^diff ' || true)
+
+case "$MODE" in
+  auto)
+    if [ "$MB" = "$(git_root rev-parse HEAD)" ]; then
+      ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})"
+    else
+      BASE_SHA=$(git_root rev-parse --short "$BASE" 2>/dev/null || echo '?')
+      ENDPOINTS="HEAD (${HEAD_SHA}, ${CUR_BRANCH}) vs ${BASE} (${BASE_SHA}), incl. uncommitted WIP"
+    fi ;;
+  uncommitted) ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})" ;;
+  commit)      ENDPOINTS="commit ${COMMIT} on ${CUR_BRANCH}" ;;
+  range)       ENDPOINTS="range ${RANGE}" ;;
+esac
+
+printf 'reviewer: diff to review — %s\nreviewer: +%s / -%s across %s file(s)%s\n' \
+  "$ENDPOINTS" "${N_ADD:-0}" "${N_DEL:-0}" "$N_FILES" \
+  "${FOCUS:+ · focus: $FOCUS}" >&2
 
 # ---- gather specs -----------------------------------------------------------
 # An explicitly supplied spec that cannot be resolved/fetched is a SETUP ERROR:
@@ -277,8 +325,6 @@ ${DIFF}
 ===== END DIFF UNDER REVIEW ====="
 
 # ---- run --------------------------------------------------------------------
-REPORT="${TMPDIR:-/tmp}/reviewer-report.$$.md"
-
 CODEX_ARGS=(exec --sandbox read-only --color never -C "$ROOT"
             -c approval_policy="never" -o "$REPORT")
 [ -n "$MODEL" ] && CODEX_ARGS+=(-m "$MODEL")
@@ -293,8 +339,8 @@ fi
 
 command -v codex >/dev/null 2>&1 || die "codex not found on PATH"
 
-printf 'reviewer: reviewing %s\nreviewer: repo %s | base %s | model %s\nreviewer: final report -> %s\n\n' \
-  "$SCOPE_DESC" "$ROOT" "$BASE" "${MODEL:-<codex default>}" "$REPORT" >&2
+printf 'reviewer: starting codex (model %s, read-only sandbox) → report %s\n\n' \
+  "${MODEL:-<codex default>}" "$REPORT" >&2
 
 # Don't let a nonzero codex exit trip `set -e` before we print the report.
 set +e

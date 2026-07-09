@@ -18,10 +18,32 @@ anything — it reports findings and recommendations only. The engine is
   catch your own mistakes with an independent adversary.
 - To confirm a change actually satisfies the issue/spec it was meant to.
 
+## Invoking as `/reviewer [prompt]`
+
+When the user runs `/reviewer` (optionally with text), **that invocation is the
+go-ahead — kick off the review immediately**, don't deliberate or re-confirm.
+Any free text becomes the reviewer's **focus** and is forwarded straight to
+codex, e.g. `/reviewer scrutinise the retry logic`. So the flow is:
+
+1. Map the user's text to a `review.sh` call: free text → focus; if they name a
+   scope ("just my uncommitted changes", "that last commit") use the matching
+   flag; if they point at an issue/spec, pass it via `--spec` (see THE RULE).
+2. Run it. The script prints a context banner before codex starts, e.g.:
+
+   ```
+   reviewer: diff to review — HEAD (eaa6b52, my-feature-branch) vs main (4a31ccb), incl. uncommitted WIP
+   reviewer: +5 / -1 across 2 file(s) · focus: scrutinise the retry logic
+   reviewer: starting codex (model <codex default>, read-only sandbox) → report /tmp/reviewer-report.NNN.md
+   ```
+
+   Glance at it — if the stat looks wrong (e.g. thousands of lines from
+   untracked data dirs pulled in by the default scope), narrow with a scope flag
+   before spending.
+
 ## How to run it
 
 ```bash
-~/.claude/skills/reviewer/review.sh --spec <PATH_OR_URL> [scope] [--focus TEXT]
+~/.claude/skills/reviewer/review.sh [--spec <PATH_OR_URL>] [scope] ["focus text"]
 ```
 
 Default scope is the working tree vs the merge-base with the base branch
@@ -32,9 +54,10 @@ Default scope is the working tree vs the merge-base with the base branch
 - `--range <A..B>` / `--range <main...HEAD>` — an explicit range.
 - `--base <branch>` — base for the default/auto scope (autodetected otherwise).
 
-Other flags: `--model <M>` (codex model override), `-C <dir>` (repo dir),
-`--focus "<text>"` (extra reviewer instructions), `--dry-run` (print the prompt
-and command, spend nothing — use this to preview), `--help`.
+Scope options are mutually exclusive. Free-text trailing args (or `--focus
+"<text>"`) become the reviewer's focus. Other flags: `--model <M>` (codex model
+override), `-C <dir>` (repo dir), `--dry-run` (print the banner + prompt +
+command, spend nothing — use this to preview), `--help`.
 
 ## THE RULE: link the spec, never paraphrase it
 
@@ -56,10 +79,14 @@ quality) — but do not invent a spec block.
 
 ## Cost & etiquette
 
-Running this spends the user's `codex`/OpenAI quota. Per the user's
-"confirm before paid calls" rule, **get a quick go-ahead before the first real
-run** (a `--dry-run` is free and needs no confirmation). Mention roughly what
-you're about to review.
+Running this spends the user's `codex`/OpenAI quota.
+
+- **User-invoked** (`/reviewer …`, or "review this / get a second opinion"): the
+  request *is* the go-ahead — run immediately, no extra confirmation. The banner
+  already tells them what's being reviewed.
+- **Self-initiated** (you decide to review your own work without being asked):
+  per the "confirm before paid calls" rule, get a quick go-ahead first. A
+  `--dry-run` is free and never needs confirmation.
 
 ## After it runs
 
