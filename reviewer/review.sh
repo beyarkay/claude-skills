@@ -41,8 +41,8 @@ set -euo pipefail
 die()  { printf 'reviewer: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'reviewer: %s\n' "$*" >&2; }
 
-command -v codex >/dev/null 2>&1 || die "codex not found on PATH"
-command -v git   >/dev/null 2>&1 || die "git not found on PATH"
+# Tool availability is checked later: git after arg-parsing (needed even for
+# --dry-run), codex only before a real run (so --help/--dry-run work without it).
 
 # ---- defaults ---------------------------------------------------------------
 DIR="$PWD"
@@ -54,25 +54,41 @@ MODEL=""
 FOCUS=""
 DRY_RUN=0
 SPECS=()
+SPEC_TMPFILES=()
+
+# Clean up any verbatim-fetched spec temp files (they may hold private issue/PR
+# text). The EXIT trap covers normal exits, errors and dry-run; the signal trap
+# re-exits through it so Ctrl-C / kill during a long review also cleans up.
+cleanup() { [ "${#SPEC_TMPFILES[@]}" -gt 0 ] && rm -f "${SPEC_TMPFILES[@]}"; return 0; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+# At most one scope option may be chosen.
+set_scope() {
+  [ "$MODE" = "auto" ] || die "pick at most one scope option (already have --$MODE)"
+  MODE="$1"
+}
 
 # ---- arg parsing ------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
     --spec)        [ $# -ge 2 ] || die "--spec needs a value"; SPECS+=("$2"); shift 2 ;;
-    --uncommitted) MODE="uncommitted"; shift ;;
-    --commit)      [ $# -ge 2 ] || die "--commit needs a SHA"; MODE="commit"; COMMIT="$2"; shift 2 ;;
-    --range)       [ $# -ge 2 ] || die "--range needs a git range"; MODE="range"; RANGE="$2"; shift 2 ;;
+    --uncommitted) set_scope uncommitted; shift ;;
+    --commit)      [ $# -ge 2 ] || die "--commit needs a SHA"; set_scope commit; COMMIT="$2"; shift 2 ;;
+    --range)       [ $# -ge 2 ] || die "--range needs a git range"; set_scope range; RANGE="$2"; shift 2 ;;
     --base)        [ $# -ge 2 ] || die "--base needs a branch"; BASE="$2"; shift 2 ;;
     --model)       [ $# -ge 2 ] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
     -C|--cd)       [ $# -ge 2 ] || die "$1 needs a directory"; DIR="$2"; shift 2 ;;
     --focus)       [ $# -ge 2 ] || die "--focus needs text"; FOCUS="$2"; shift 2 ;;
     --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     awk 'NR<3{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
     *)             die "unknown argument: $1 (see --help)" ;;
   esac
 done
 
 # ---- resolve repo -----------------------------------------------------------
+command -v git >/dev/null 2>&1 || die "git not found on PATH"
+
 ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) \
   || die "not inside a git repository: $DIR"
 
@@ -85,6 +101,15 @@ abspath() {
   if [ -d "$p" ]; then (cd "$p" >/dev/null 2>&1 && pwd); return; fi
   local d b; d=$(dirname -- "$p"); b=$(basename -- "$p")
   printf '%s/%s\n' "$(cd "$d" >/dev/null 2>&1 && pwd)" "$b"
+}
+
+resolve_local() {
+  # Print an absolute path for a local spec, trying CWD then the repo root.
+  # (Relative --spec paths should work regardless of -C.) Non-zero if neither.
+  local s="$1"
+  if [ -e "$s" ];       then abspath "$s";       return 0; fi
+  if [ -e "$ROOT/$s" ]; then abspath "$ROOT/$s"; return 0; fi
+  return 1
 }
 
 is_blank() { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
@@ -140,19 +165,20 @@ esac
 is_blank "$DIFF" && die "no changes to review for the selected scope"
 
 # ---- gather specs -----------------------------------------------------------
+# An explicitly supplied spec that cannot be resolved/fetched is a SETUP ERROR:
+# fail closed rather than silently spend quota reviewing against no/wrong spec.
 SPEC_LINKS=""      # local paths codex must read itself
 SPEC_EMBEDS=""     # verbatim content fetched from URLs
+SPEC_FAILS=()      # supplied specs we could not resolve
 for s in ${SPECS[@]+"${SPECS[@]}"}; do
-  if [ -e "$s" ]; then
-    SPEC_LINKS="${SPEC_LINKS}  - $(abspath "$s")"$'\n'
-  elif printf '%s' "$s" | grep -qiE '^https?://'; then
-    tmpf=$(mktemp -t reviewer-spec.XXXXXX)
+  if printf '%s' "$s" | grep -qiE '^https?://'; then
+    tmpf=$(mktemp -t reviewer-spec.XXXXXX); SPEC_TMPFILES+=("$tmpf")
     if printf '%s' "$s" | grep -qE 'github\.com/.+/issues/[0-9]+' && command -v gh >/dev/null 2>&1; then
-      gh issue view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || warn "could not fetch spec: $s"
+      gh issue view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
     elif printf '%s' "$s" | grep -qE 'github\.com/.+/pull/[0-9]+' && command -v gh >/dev/null 2>&1; then
-      gh pr view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || warn "could not fetch spec: $s"
+      gh pr view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
     else
-      curl -fsSL "$s" >"$tmpf" 2>/dev/null || warn "could not fetch spec: $s"
+      curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
     fi
     if [ -s "$tmpf" ]; then
       SPEC_EMBEDS="${SPEC_EMBEDS}
@@ -160,11 +186,18 @@ for s in ${SPECS[@]+"${SPECS[@]}"}; do
 $(cat "$tmpf")
 ----- END SPEC (${s}) -----
 "
+    else
+      SPEC_FAILS+=("$s (fetch returned nothing)")
     fi
+  elif p=$(resolve_local "$s"); then
+    SPEC_LINKS="${SPEC_LINKS}  - $p"$'\n'
   else
-    warn "spec '$s' is neither an existing file nor an http(s) URL; skipping"
+    SPEC_FAILS+=("$s (no such file; tried CWD and $ROOT)")
   fi
 done
+if [ "${#SPEC_FAILS[@]}" -gt 0 ]; then
+  die "could not resolve --spec source(s); aborting before spending quota:$(printf '\n  - %s' "${SPEC_FAILS[@]}")"
+fi
 
 # ---- assemble the prompt ----------------------------------------------------
 if [ -n "$SPEC_LINKS" ] || [ -n "$SPEC_EMBEDS" ]; then
@@ -258,11 +291,16 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+command -v codex >/dev/null 2>&1 || die "codex not found on PATH"
+
 printf 'reviewer: reviewing %s\nreviewer: repo %s | base %s | model %s\nreviewer: final report -> %s\n\n' \
   "$SCOPE_DESC" "$ROOT" "$BASE" "${MODEL:-<codex default>}" "$REPORT" >&2
 
+# Don't let a nonzero codex exit trip `set -e` before we print the report.
+set +e
 printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}"
 status=$?
+set -e
 
 if [ -s "$REPORT" ]; then
   printf '\n\n===== FINAL REVIEW REPORT (%s) =====\n' "$REPORT"
