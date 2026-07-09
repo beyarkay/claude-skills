@@ -31,9 +31,16 @@
 #   -C, --cd DIR        Repo directory to review in (default: current dir).
 #   --focus TEXT        Extra reviewer instructions appended to the prompt.
 #                       Equivalent: pass the text as trailing free-text args.
+#   --quiet, -q         Print only the final report on stdout (suppress codex's
+#                       live event stream, which is kept in a log file). Ideal
+#                       for feeding the report into another tool's context.
 #   --dry-run           Print the assembled prompt and the codex command; run
 #                       nothing (no API cost). Use to inspect before spending.
 #   -h, --help          This help.
+#
+# Large diffs (> 200 lines) are handed to codex as a --stat summary plus the git
+# command to reproduce them; codex reads the full diff itself via its read-only
+# repo access. Smaller diffs are embedded inline.
 #
 # Exit status is codex's own, or non-zero on a setup error.
 
@@ -54,6 +61,7 @@ RANGE=""
 MODEL=""
 FOCUS=""
 DRY_RUN=0
+QUIET=0
 SPECS=()
 SPEC_TMPFILES=()
 POSITIONAL=()
@@ -82,6 +90,7 @@ while [ $# -gt 0 ]; do
     --model)       [ $# -ge 2 ] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
     -C|--cd)       [ $# -ge 2 ] || die "$1 needs a directory"; DIR="$2"; shift 2 ;;
     --focus)       [ $# -ge 2 ] || die "--focus needs text"; FOCUS="$2"; shift 2 ;;
+    --quiet|-q)    QUIET=1; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
     -h|--help)     awk 'NR<3{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
     -*)            die "unknown option: $1 (see --help)" ;;
@@ -144,6 +153,15 @@ untracked_diff() {
   done
 }
 
+untracked_stat() {
+  # List untracked files with line counts (they're absent from git diff --stat).
+  local f
+  git_root ls-files --others --exclude-standard | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf ' %s (untracked, %s lines)\n' "$f" "$(wc -l <"$ROOT/$f" 2>/dev/null | tr -d ' ')"
+  done
+}
+
 diffstat() {
   # Count added/removed CONTENT lines in a unified diff read from stdin. Counts
   # only inside hunks, so +++/--- file headers are never miscounted. Prints
@@ -187,13 +205,30 @@ esac
 
 is_blank "$DIFF" && die "no changes to review for the selected scope"
 
-# ---- kickoff banner ---------------------------------------------------------
-# A little context so you can see exactly what's being handed to codex.
+# ---- kickoff banner + large-diff handling -----------------------------------
+# Context so you can see exactly what's being handed to codex. If the diff is big
+# (> DIFF_MAX_LINES), hand codex only the --stat summary plus the command to
+# reproduce it, and let it pull the real diff itself (read-only repo access) —
+# keeps the prompt small and avoids dumping thousands of lines (e.g. untracked
+# data dirs pulled in by the default scope).
+DIFF_MAX_LINES=200
 REPORT="${TMPDIR:-/tmp}/reviewer-report.$$.md"
 HEAD_SHA=$(git_root rev-parse --short HEAD 2>/dev/null || echo '?')
 CUR_BRANCH=$(git_root rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
 read -r N_ADD N_DEL < <(printf '%s' "$DIFF" | diffstat)
 N_FILES=$(printf '%s\n' "$DIFF" | grep -cE '^diff ' || true)
+DIFF_LINES=$(printf '%s\n' "$DIFF" | wc -l | tr -d ' ')
+
+STAT=""    # non-empty ⇒ hand codex the summary instead of the full diff
+REPRO=""   # the git command codex should run to see the full diff
+if [ "$DIFF_LINES" -gt "$DIFF_MAX_LINES" ]; then
+  case "$MODE" in
+    commit)      STAT=$(git_root show --stat --oneline "$COMMIT");  REPRO="git show $COMMIT" ;;
+    range)       STAT=$(git_root diff --stat "$RANGE");             REPRO="git diff $RANGE" ;;
+    uncommitted) STAT=$(git_root diff --stat HEAD; untracked_stat); REPRO="git diff HEAD  (and read the untracked files listed)" ;;
+    auto)        STAT=$(git_root diff --stat "$MB"; untracked_stat); REPRO="git diff $MB  (and read the untracked files listed)" ;;
+  esac
+fi
 
 case "$MODE" in
   auto)
@@ -208,9 +243,11 @@ case "$MODE" in
   range)       ENDPOINTS="range ${RANGE}" ;;
 esac
 
-printf 'reviewer: diff to review — %s\nreviewer: +%s / -%s across %s file(s)%s\n' \
+BANNER=$(printf 'reviewer: diff to review — %s\nreviewer: +%s / -%s across %s file(s)%s%s' \
   "$ENDPOINTS" "${N_ADD:-0}" "${N_DEL:-0}" "$N_FILES" \
-  "${FOCUS:+ · focus: $FOCUS}" >&2
+  "${FOCUS:+ · focus: $FOCUS}" \
+  "${STAT:+ · large diff (${DIFF_LINES} lines) → codex gets --stat and reads it itself}")
+printf '%s\n' "$BANNER" >&2
 
 # ---- gather specs -----------------------------------------------------------
 # An explicitly supplied spec that cannot be resolved/fetched is a SETUP ERROR:
@@ -271,6 +308,23 @@ EXTRA FOCUS FROM THE REQUESTER:
 $FOCUS
 " || FOCUS_BLOCK=""
 
+if [ -n "$STAT" ]; then
+  DIFF_SECTION="This diff is large (${DIFF_LINES} lines), so only its --stat
+summary is shown below. You have read-only access to the whole repo — run
+  ${REPRO}
+yourself to read the actual changes, and open any file you need to dig deeper.
+
+===== DIFF --stat SUMMARY (${N_FILES} files, +${N_ADD:-0}/-${N_DEL:-0}) =====
+${STAT}
+===== END SUMMARY ====="
+else
+  DIFF_SECTION="The full diff follows.
+
+===== BEGIN DIFF UNDER REVIEW =====
+${DIFF}
+===== END DIFF UNDER REVIEW ====="
+fi
+
 PROMPT="You are acting as a hostile, highly skeptical senior code reviewer. Your
 sole job is to find problems in the change under review. Assume it is buggy
 until you have proven otherwise by reading the code. Being agreeable is a
@@ -318,11 +372,9 @@ OUTPUT FORMAT — produce a concise report, nothing else:
 If, after genuinely digging, you find nothing wrong, say so plainly rather than
 inventing nits.
 
-The change under review is ${SCOPE_DESC}. The full diff follows.
+The change under review is ${SCOPE_DESC}.
 
-===== BEGIN DIFF UNDER REVIEW =====
-${DIFF}
-===== END DIFF UNDER REVIEW ====="
+${DIFF_SECTION}"
 
 # ---- run --------------------------------------------------------------------
 CODEX_ARGS=(exec --sandbox read-only --color never -C "$ROOT"
@@ -344,11 +396,26 @@ printf 'reviewer: starting codex (model %s, read-only sandbox) → report %s\n\n
 
 # Don't let a nonzero codex exit trip `set -e` before we print the report.
 set +e
-printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}"
-status=$?
+if [ "$QUIET" -eq 1 ]; then
+  # Quiet: hide codex's live event stream (kept in a log); emit only the banner
+  # + final report on stdout, so the output is clean to inject elsewhere.
+  CODEX_LOG="${TMPDIR:-/tmp}/reviewer-codex.$$.log"
+  printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}" >"$CODEX_LOG" 2>&1
+  status=$?
+else
+  printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}"
+  status=$?
+fi
 set -e
 
-if [ -s "$REPORT" ]; then
+if [ "$QUIET" -eq 1 ]; then
+  printf '%s\n\n' "$BANNER"
+  if [ -s "$REPORT" ]; then
+    cat "$REPORT"
+  else
+    printf '(reviewer: codex produced no report; exit %s. Full codex log: %s)\n' "$status" "$CODEX_LOG"
+  fi
+elif [ -s "$REPORT" ]; then
   printf '\n\n===== FINAL REVIEW REPORT (%s) =====\n' "$REPORT"
   cat "$REPORT"
 fi
