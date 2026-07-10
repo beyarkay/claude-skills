@@ -31,6 +31,11 @@
 #   -C, --cd DIR        Repo directory to review in (default: current dir).
 #   --focus TEXT        Extra reviewer instructions appended to the prompt.
 #                       Equivalent: pass the text as trailing free-text args.
+#   --focus-stdin       Read the focus text from stdin instead of the argument
+#                       list (only if stdin is not a terminal). Lets a caller
+#                       feed arbitrary text — quotes, $, backticks, globs — via
+#                       a heredoc without the shell re-parsing it. An explicit
+#                       --focus wins over it.
 #   --quiet, -q         Print only the final report on stdout (suppress codex's
 #                       live event stream, which is kept in a log file). Ideal
 #                       for feeding the report into another tool's context.
@@ -46,7 +51,10 @@
 
 set -euo pipefail
 
-die()  { printf 'reviewer: %s\n' "$*" >&2; exit 1; }
+die() {
+    printf 'reviewer: %s\n' "$*" >&2
+    exit 1
+}
 warn() { printf 'reviewer: %s\n' "$*" >&2; }
 
 # Tool availability is checked later: git after arg-parsing (needed even for
@@ -60,6 +68,7 @@ COMMIT=""
 RANGE=""
 MODEL=""
 FOCUS=""
+FOCUS_STDIN=0
 DRY_RUN=0
 QUIET=0
 SPECS=()
@@ -69,104 +78,181 @@ POSITIONAL=()
 # Clean up any verbatim-fetched spec temp files (they may hold private issue/PR
 # text). The EXIT trap covers normal exits, errors and dry-run; the signal trap
 # re-exits through it so Ctrl-C / kill during a long review also cleans up.
-cleanup() { [ "${#SPEC_TMPFILES[@]}" -gt 0 ] && rm -f "${SPEC_TMPFILES[@]}"; return 0; }
+cleanup() {
+    [ "${#SPEC_TMPFILES[@]}" -gt 0 ] && rm -f "${SPEC_TMPFILES[@]}"
+    return 0
+}
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 # At most one scope option may be chosen.
 set_scope() {
-  [ "$MODE" = "auto" ] || die "pick at most one scope option (already have --$MODE)"
-  MODE="$1"
+    [ "$MODE" = "auto" ] || die "pick at most one scope option (already have --$MODE)"
+    MODE="$1"
 }
 
 # ---- arg parsing ------------------------------------------------------------
 while [ $# -gt 0 ]; do
-  case "$1" in
-    --spec)        [ $# -ge 2 ] || die "--spec needs a value"; SPECS+=("$2"); shift 2 ;;
-    --uncommitted) set_scope uncommitted; shift ;;
-    --commit)      [ $# -ge 2 ] || die "--commit needs a SHA"; set_scope commit; COMMIT="$2"; shift 2 ;;
-    --range)       [ $# -ge 2 ] || die "--range needs a git range"; set_scope range; RANGE="$2"; shift 2 ;;
-    --base)        [ $# -ge 2 ] || die "--base needs a branch"; BASE="$2"; shift 2 ;;
-    --model)       [ $# -ge 2 ] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
-    -C|--cd)       [ $# -ge 2 ] || die "$1 needs a directory"; DIR="$2"; shift 2 ;;
-    --focus)       [ $# -ge 2 ] || die "--focus needs text"; FOCUS="$2"; shift 2 ;;
-    --quiet|-q)    QUIET=1; shift ;;
-    --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     awk 'NR<3{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
-    -*)            die "unknown option: $1 (see --help)" ;;
-    *)             POSITIONAL+=("$1"); shift ;;
-  esac
+    case "$1" in
+    --spec)
+        [ $# -ge 2 ] || die "--spec needs a value"
+        SPECS+=("$2")
+        shift 2
+        ;;
+    --uncommitted)
+        set_scope uncommitted
+        shift
+        ;;
+    --commit)
+        [ $# -ge 2 ] || die "--commit needs a SHA"
+        set_scope commit
+        COMMIT="$2"
+        shift 2
+        ;;
+    --range)
+        [ $# -ge 2 ] || die "--range needs a git range"
+        set_scope range
+        RANGE="$2"
+        shift 2
+        ;;
+    --base)
+        [ $# -ge 2 ] || die "--base needs a branch"
+        BASE="$2"
+        shift 2
+        ;;
+    --model)
+        [ $# -ge 2 ] || die "--model needs a value"
+        MODEL="$2"
+        shift 2
+        ;;
+    -C | --cd)
+        [ $# -ge 2 ] || die "$1 needs a directory"
+        DIR="$2"
+        shift 2
+        ;;
+    --focus)
+        [ $# -ge 2 ] || die "--focus needs text"
+        FOCUS="$2"
+        shift 2
+        ;;
+    --focus-stdin)
+        FOCUS_STDIN=1
+        shift
+        ;;
+    --quiet | -q)
+        QUIET=1
+        shift
+        ;;
+    --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+    -h | --help)
+        awk 'NR<3{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
+        exit 0
+        ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *)
+        POSITIONAL+=("$1")
+        shift
+        ;;
+    esac
 done
+
+# Focus from stdin (--focus-stdin): lets a slash command feed arbitrary text —
+# quotes, $, backticks, globs — via a heredoc, so the shell never re-parses it.
+# Read only when stdin is a pipe/file (not a terminal), so a manual run that
+# passes the flag without piping doesn't hang. An explicit --focus wins.
+if [ "$FOCUS_STDIN" -eq 1 ] && [ -z "$FOCUS" ] && [ ! -t 0 ]; then
+    FOCUS=$(cat)
+fi
 
 # Free-text (non-flag) arguments become the reviewer's focus, so a slash-command
 # prompt is forwarded straight to codex, e.g.  review.sh "scrutinise the retry
-# logic". An explicit --focus wins if both are supplied.
+# logic". An explicit --focus (or --focus-stdin) wins if both are supplied.
 if [ -z "$FOCUS" ] && [ "${#POSITIONAL[@]}" -gt 0 ]; then
-  FOCUS="${POSITIONAL[*]}"
+    FOCUS="${POSITIONAL[*]}"
 fi
 
 # ---- resolve repo -----------------------------------------------------------
 command -v git >/dev/null 2>&1 || die "git not found on PATH"
 
-ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) \
-  || die "not inside a git repository: $DIR"
+ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) ||
+    die "not inside a git repository: $DIR"
 
 git_root() { git -C "$ROOT" "$@"; }
 
 # ---- helpers ----------------------------------------------------------------
 abspath() {
-  # portable realpath (macOS bash 3.2 has no realpath)
-  local p="$1"
-  if [ -d "$p" ]; then (cd "$p" >/dev/null 2>&1 && pwd); return; fi
-  local d b; d=$(dirname -- "$p"); b=$(basename -- "$p")
-  printf '%s/%s\n' "$(cd "$d" >/dev/null 2>&1 && pwd)" "$b"
+    # portable realpath (macOS bash 3.2 has no realpath)
+    local p="$1"
+    if [ -d "$p" ]; then
+        (cd "$p" >/dev/null 2>&1 && pwd)
+        return
+    fi
+    local d b
+    d=$(dirname -- "$p")
+    b=$(basename -- "$p")
+    printf '%s/%s\n' "$(cd "$d" >/dev/null 2>&1 && pwd)" "$b"
 }
 
 resolve_local() {
-  # Print an absolute path for a local spec, trying CWD then the repo root.
-  # (Relative --spec paths should work regardless of -C.) Non-zero if neither.
-  local s="$1"
-  if [ -e "$s" ];       then abspath "$s";       return 0; fi
-  if [ -e "$ROOT/$s" ]; then abspath "$ROOT/$s"; return 0; fi
-  return 1
+    # Print an absolute path for a local spec, trying CWD then the repo root.
+    # (Relative --spec paths should work regardless of -C.) Non-zero if neither.
+    local s="$1"
+    if [ -e "$s" ]; then
+        abspath "$s"
+        return 0
+    fi
+    if [ -e "$ROOT/$s" ]; then
+        abspath "$ROOT/$s"
+        return 0
+    fi
+    return 1
 }
 
 is_blank() { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
 
 detect_base() {
-  local b
-  for b in main master trunk develop; do
-    git_root show-ref --verify --quiet "refs/heads/$b" && { echo "$b"; return; }
-  done
-  for b in origin/main origin/master origin/HEAD; do
-    git_root show-ref --verify --quiet "refs/remotes/$b" 2>/dev/null && { echo "$b"; return; }
-  done
-  echo "HEAD"
+    local b
+    for b in main master trunk develop; do
+        git_root show-ref --verify --quiet "refs/heads/$b" && {
+            echo "$b"
+            return
+        }
+    done
+    for b in origin/main origin/master origin/HEAD; do
+        git_root show-ref --verify --quiet "refs/remotes/$b" 2>/dev/null && {
+            echo "$b"
+            return
+        }
+    done
+    echo "HEAD"
 }
 
 untracked_diff() {
-  # Emit untracked files as additions (read-only; does not touch the index).
-  local f
-  git_root ls-files --others --exclude-standard | while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    git_root diff --no-index -- /dev/null "$f" 2>/dev/null || true
-  done
+    # Emit untracked files as additions (read-only; does not touch the index).
+    local f
+    git_root ls-files --others --exclude-standard | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        git_root diff --no-index -- /dev/null "$f" 2>/dev/null || true
+    done
 }
 
 untracked_stat() {
-  # List untracked files with line counts (they're absent from git diff --stat).
-  local f
-  git_root ls-files --others --exclude-standard | while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    printf ' %s (untracked, %s lines)\n' "$f" "$(wc -l <"$ROOT/$f" 2>/dev/null | tr -d ' ')"
-  done
+    # List untracked files with line counts (they're absent from git diff --stat).
+    local f
+    git_root ls-files --others --exclude-standard | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf ' %s (untracked, %s lines)\n' "$f" "$(wc -l <"$ROOT/$f" 2>/dev/null | tr -d ' ')"
+    done
 }
 
 diffstat() {
-  # Count added/removed CONTENT lines in a unified diff read from stdin. Counts
-  # only inside hunks, so +++/--- file headers are never miscounted. Prints
-  # "<added> <removed>".
-  awk '
+    # Count added/removed CONTENT lines in a unified diff read from stdin. Counts
+    # only inside hunks, so +++/--- file headers are never miscounted. Prints
+    # "<added> <removed>".
+    awk '
     /^@@/ { inhunk=1; next }
     /^(diff |index |--- |\+\+\+ |Binary |new file|deleted file|rename |similarity |old mode|new mode|GIT binary)/ { inhunk=0; next }
     inhunk && /^\+/ { add++ }
@@ -179,26 +265,32 @@ diffstat() {
 [ -n "$BASE" ] || BASE=$(detect_base)
 
 case "$MODE" in
-  commit)
+commit)
     git_root cat-file -e "${COMMIT}^{commit}" 2>/dev/null || die "no such commit: $COMMIT"
     DIFF=$(git_root show --patch --stat "$COMMIT")
     SCOPE_DESC="the change introduced by commit $COMMIT"
     ;;
-  range)
+range)
     DIFF=$(git_root diff "$RANGE") || die "bad git range: $RANGE"
     SCOPE_DESC="git range $RANGE"
     ;;
-  uncommitted)
-    DIFF=$(git_root diff HEAD; untracked_diff)
+uncommitted)
+    DIFF=$(
+        git_root diff HEAD
+        untracked_diff
+    )
     SCOPE_DESC="the uncommitted changes (staged + unstaged + untracked)"
     ;;
-  auto)
+auto)
     MB=$(git_root merge-base "$BASE" HEAD 2>/dev/null || git_root rev-parse HEAD)
-    DIFF=$(git_root diff "$MB"; untracked_diff)
+    DIFF=$(
+        git_root diff "$MB"
+        untracked_diff
+    )
     SCOPE_DESC="the working tree vs its merge-base with '$BASE' ($MB) — committed branch work plus any uncommitted changes"
     if is_blank "$DIFF"; then
-      DIFF=$(git_root show --patch --stat HEAD)
-      SCOPE_DESC="the last commit (HEAD) — there is no diff against base '$BASE'"
+        DIFF=$(git_root show --patch --stat HEAD)
+        SCOPE_DESC="the last commit (HEAD) — there is no diff against base '$BASE'"
     fi
     ;;
 esac
@@ -219,87 +311,107 @@ read -r N_ADD N_DEL < <(printf '%s' "$DIFF" | diffstat)
 N_FILES=$(printf '%s\n' "$DIFF" | grep -cE '^diff ' || true)
 DIFF_LINES=$(printf '%s\n' "$DIFF" | wc -l | tr -d ' ')
 
-STAT=""    # non-empty ⇒ hand codex the summary instead of the full diff
-REPRO=""   # the git command codex should run to see the full diff
+STAT=""  # non-empty ⇒ hand codex the summary instead of the full diff
+REPRO="" # the git command codex should run to see the full diff
 if [ "$DIFF_LINES" -gt "$DIFF_MAX_LINES" ]; then
-  case "$MODE" in
-    commit)      STAT=$(git_root show --stat --oneline "$COMMIT");  REPRO="git show $COMMIT" ;;
-    range)       STAT=$(git_root diff --stat "$RANGE");             REPRO="git diff $RANGE" ;;
-    uncommitted) STAT=$(git_root diff --stat HEAD; untracked_stat); REPRO="git diff HEAD  (and read the untracked files listed)" ;;
-    auto)        STAT=$(git_root diff --stat "$MB"; untracked_stat); REPRO="git diff $MB  (and read the untracked files listed)" ;;
-  esac
+    case "$MODE" in
+    commit)
+        STAT=$(git_root show --stat --oneline "$COMMIT")
+        REPRO="git show $COMMIT"
+        ;;
+    range)
+        STAT=$(git_root diff --stat "$RANGE")
+        REPRO="git diff $RANGE"
+        ;;
+    uncommitted)
+        STAT=$(
+            git_root diff --stat HEAD
+            untracked_stat
+        )
+        REPRO="git diff HEAD  (and read the untracked files listed)"
+        ;;
+    auto)
+        STAT=$(
+            git_root diff --stat "$MB"
+            untracked_stat
+        )
+        REPRO="git diff $MB  (and read the untracked files listed)"
+        ;;
+    esac
 fi
 
 case "$MODE" in
-  auto)
+auto)
     if [ "$MB" = "$(git_root rev-parse HEAD)" ]; then
-      ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})"
+        ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})"
     else
-      BASE_SHA=$(git_root rev-parse --short "$BASE" 2>/dev/null || echo '?')
-      ENDPOINTS="HEAD (${HEAD_SHA}, ${CUR_BRANCH}) vs ${BASE} (${BASE_SHA}), incl. uncommitted WIP"
-    fi ;;
-  uncommitted) ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})" ;;
-  commit)      ENDPOINTS="commit ${COMMIT} on ${CUR_BRANCH}" ;;
-  range)       ENDPOINTS="range ${RANGE}" ;;
+        BASE_SHA=$(git_root rev-parse --short "$BASE" 2>/dev/null || echo '?')
+        ENDPOINTS="HEAD (${HEAD_SHA}, ${CUR_BRANCH}) vs ${BASE} (${BASE_SHA}), incl. uncommitted WIP"
+    fi
+    ;;
+uncommitted) ENDPOINTS="uncommitted changes on ${CUR_BRANCH} (HEAD ${HEAD_SHA})" ;;
+commit) ENDPOINTS="commit ${COMMIT} on ${CUR_BRANCH}" ;;
+range) ENDPOINTS="range ${RANGE}" ;;
 esac
 
 BANNER=$(printf 'reviewer: diff to review — %s\nreviewer: +%s / -%s across %s file(s)%s%s' \
-  "$ENDPOINTS" "${N_ADD:-0}" "${N_DEL:-0}" "$N_FILES" \
-  "${FOCUS:+ · focus: $FOCUS}" \
-  "${STAT:+ · large diff (${DIFF_LINES} lines) → codex gets --stat and reads it itself}")
+    "$ENDPOINTS" "${N_ADD:-0}" "${N_DEL:-0}" "$N_FILES" \
+    "${FOCUS:+ · focus: $FOCUS}" \
+    "${STAT:+ · large diff (${DIFF_LINES} lines) → codex gets --stat and reads it itself}")
 printf '%s\n' "$BANNER" >&2
 
 # ---- gather specs -----------------------------------------------------------
 # An explicitly supplied spec that cannot be resolved/fetched is a SETUP ERROR:
 # fail closed rather than silently spend quota reviewing against no/wrong spec.
-SPEC_LINKS=""      # local paths codex must read itself
-SPEC_EMBEDS=""     # verbatim content fetched from URLs
-SPEC_FAILS=()      # supplied specs we could not resolve
+SPEC_LINKS=""  # local paths codex must read itself
+SPEC_EMBEDS="" # verbatim content fetched from URLs
+SPEC_FAILS=()  # supplied specs we could not resolve
 for s in ${SPECS[@]+"${SPECS[@]}"}; do
-  if printf '%s' "$s" | grep -qiE '^https?://'; then
-    tmpf=$(mktemp -t reviewer-spec.XXXXXX); SPEC_TMPFILES+=("$tmpf")
-    if printf '%s' "$s" | grep -qE 'github\.com/.+/issues/[0-9]+' && command -v gh >/dev/null 2>&1; then
-      gh issue view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
-    elif printf '%s' "$s" | grep -qE 'github\.com/.+/pull/[0-9]+' && command -v gh >/dev/null 2>&1; then
-      gh pr view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
-    else
-      curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
-    fi
-    if [ -s "$tmpf" ]; then
-      SPEC_EMBEDS="${SPEC_EMBEDS}
+    if printf '%s' "$s" | grep -qiE '^https?://'; then
+        tmpf=$(mktemp -t reviewer-spec.XXXXXX)
+        SPEC_TMPFILES+=("$tmpf")
+        if printf '%s' "$s" | grep -qE 'github\.com/.+/issues/[0-9]+' && command -v gh >/dev/null 2>&1; then
+            gh issue view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
+        elif printf '%s' "$s" | grep -qE 'github\.com/.+/pull/[0-9]+' && command -v gh >/dev/null 2>&1; then
+            gh pr view "$s" --comments >"$tmpf" 2>/dev/null || curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
+        else
+            curl -fsSL "$s" >"$tmpf" 2>/dev/null || true
+        fi
+        if [ -s "$tmpf" ]; then
+            SPEC_EMBEDS="${SPEC_EMBEDS}
 ----- ORIGINAL SPEC, fetched verbatim from ${s} ($(wc -c <"$tmpf" | tr -d ' ') bytes) -----
 $(cat "$tmpf")
 ----- END SPEC (${s}) -----
 "
+        else
+            SPEC_FAILS+=("$s (fetch returned nothing)")
+        fi
+    elif p=$(resolve_local "$s"); then
+        SPEC_LINKS="${SPEC_LINKS}  - $p"$'\n'
     else
-      SPEC_FAILS+=("$s (fetch returned nothing)")
+        SPEC_FAILS+=("$s (no such file; tried CWD and $ROOT)")
     fi
-  elif p=$(resolve_local "$s"); then
-    SPEC_LINKS="${SPEC_LINKS}  - $p"$'\n'
-  else
-    SPEC_FAILS+=("$s (no such file; tried CWD and $ROOT)")
-  fi
 done
 if [ "${#SPEC_FAILS[@]}" -gt 0 ]; then
-  die "could not resolve --spec source(s); aborting before spending quota:$(printf '\n  - %s' "${SPEC_FAILS[@]}")"
+    die "could not resolve --spec source(s); aborting before spending quota:$(printf '\n  - %s' "${SPEC_FAILS[@]}")"
 fi
 
 # ---- assemble the prompt ----------------------------------------------------
 if [ -n "$SPEC_LINKS" ] || [ -n "$SPEC_EMBEDS" ]; then
-  SPEC_BLOCK="THE ORIGINAL REQUEST (READ IT YOURSELF, IN FULL, FIRST).
+    SPEC_BLOCK="THE ORIGINAL REQUEST (READ IT YOURSELF, IN FULL, FIRST).
 This change is meant to satisfy the specification / issue / bug report below.
 Do NOT trust any paraphrase of it — go to the source. Judge the diff against
 what the source actually asks for, and call out anywhere the change
 misunderstands it, under-delivers on it, quietly drops a requirement, or
 contradicts it."
-  [ -n "$SPEC_LINKS" ] && SPEC_BLOCK="${SPEC_BLOCK}
+    [ -n "$SPEC_LINKS" ] && SPEC_BLOCK="${SPEC_BLOCK}
 
 Read these file(s) directly from disk:
 ${SPEC_LINKS}"
-  [ -n "$SPEC_EMBEDS" ] && SPEC_BLOCK="${SPEC_BLOCK}
+    [ -n "$SPEC_EMBEDS" ] && SPEC_BLOCK="${SPEC_BLOCK}
 ${SPEC_EMBEDS}"
 else
-  SPEC_BLOCK="THE ORIGINAL REQUEST.
+    SPEC_BLOCK="THE ORIGINAL REQUEST.
 No spec was supplied. Review purely for correctness, safety and quality."
 fi
 
@@ -309,7 +421,7 @@ $FOCUS
 " || FOCUS_BLOCK=""
 
 if [ -n "$STAT" ]; then
-  DIFF_SECTION="This diff is large (${DIFF_LINES} lines), so only its --stat
+    DIFF_SECTION="This diff is large (${DIFF_LINES} lines), so only its --stat
 summary is shown below. You have read-only access to the whole repo — run
   ${REPRO}
 yourself to read the actual changes, and open any file you need to dig deeper.
@@ -318,7 +430,7 @@ yourself to read the actual changes, and open any file you need to dig deeper.
 ${STAT}
 ===== END SUMMARY ====="
 else
-  DIFF_SECTION="The full diff follows.
+    DIFF_SECTION="The full diff follows.
 
 ===== BEGIN DIFF UNDER REVIEW =====
 ${DIFF}
@@ -378,45 +490,47 @@ ${DIFF_SECTION}"
 
 # ---- run --------------------------------------------------------------------
 CODEX_ARGS=(exec --sandbox read-only --color never -C "$ROOT"
-            -c approval_policy="never" -o "$REPORT")
+    -c approval_policy="never" -o "$REPORT")
 [ -n "$MODEL" ] && CODEX_ARGS+=(-m "$MODEL")
 CODEX_ARGS+=(-)
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '===== DRY RUN: codex command =====\n'
-  printf 'codex'; for a in "${CODEX_ARGS[@]}"; do printf ' %q' "$a"; done; printf ' < <prompt>\n\n'
-  printf '===== DRY RUN: assembled prompt =====\n%s\n' "$PROMPT"
-  exit 0
+    printf '===== DRY RUN: codex command =====\n'
+    printf 'codex'
+    for a in "${CODEX_ARGS[@]}"; do printf ' %q' "$a"; done
+    printf ' < <prompt>\n\n'
+    printf '===== DRY RUN: assembled prompt =====\n%s\n' "$PROMPT"
+    exit 0
 fi
 
 command -v codex >/dev/null 2>&1 || die "codex not found on PATH"
 
 printf 'reviewer: starting codex (model %s, read-only sandbox) → report %s\n\n' \
-  "${MODEL:-<codex default>}" "$REPORT" >&2
+    "${MODEL:-<codex default>}" "$REPORT" >&2
 
 # Don't let a nonzero codex exit trip `set -e` before we print the report.
 set +e
 if [ "$QUIET" -eq 1 ]; then
-  # Quiet: hide codex's live event stream (kept in a log); emit only the banner
-  # + final report on stdout, so the output is clean to inject elsewhere.
-  CODEX_LOG="${TMPDIR:-/tmp}/reviewer-codex.$$.log"
-  printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}" >"$CODEX_LOG" 2>&1
-  status=$?
+    # Quiet: hide codex's live event stream (kept in a log); emit only the banner
+    # + final report on stdout, so the output is clean to inject elsewhere.
+    CODEX_LOG="${TMPDIR:-/tmp}/reviewer-codex.$$.log"
+    printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}" >"$CODEX_LOG" 2>&1
+    status=$?
 else
-  printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}"
-  status=$?
+    printf '%s' "$PROMPT" | codex "${CODEX_ARGS[@]}"
+    status=$?
 fi
 set -e
 
 if [ "$QUIET" -eq 1 ]; then
-  printf '%s\n\n' "$BANNER"
-  if [ -s "$REPORT" ]; then
-    cat "$REPORT"
-  else
-    printf '(reviewer: codex produced no report; exit %s. Full codex log: %s)\n' "$status" "$CODEX_LOG"
-  fi
+    printf '%s\n\n' "$BANNER"
+    if [ -s "$REPORT" ]; then
+        cat "$REPORT"
+    else
+        printf '(reviewer: codex produced no report; exit %s. Full codex log: %s)\n' "$status" "$CODEX_LOG"
+    fi
 elif [ -s "$REPORT" ]; then
-  printf '\n\n===== FINAL REVIEW REPORT (%s) =====\n' "$REPORT"
-  cat "$REPORT"
+    printf '\n\n===== FINAL REVIEW REPORT (%s) =====\n' "$REPORT"
+    cat "$REPORT"
 fi
 exit $status

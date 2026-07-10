@@ -41,6 +41,10 @@ review.sh [--spec PATH_OR_URL]... [scope] [options] ["focus text"]
 - `--model MODEL` — codex model override (default: codex's configured model).
 - `-C, --cd DIR` — repo directory (default: current dir).
 - `--focus TEXT` — extra reviewer instructions (equivalently, trailing free text).
+- `--focus-stdin` — read the focus from stdin (only if stdin isn't a terminal),
+  so a caller can feed arbitrary text — quotes, `$`, backticks, globs — via a
+  heredoc without the shell re-parsing it. How the `/reviewer` skill forwards
+  your prompt. An explicit `--focus` wins.
 - `--quiet, -q` — print only the banner + final report on stdout; codex's live
   event stream is suppressed (kept in a log). Used by the `/reviewer` skill.
 - `--dry-run` — print the banner, assembled prompt and codex command; spend
