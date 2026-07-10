@@ -11,7 +11,7 @@ disable-model-invocation: true
 The read-only, adversarial codex reviewer has been run on the current diff — it
 reads the whole repo to dig, but cannot edit anything. Its report:
 
-!`/Users/brk/.claude/skills/reviewer/review.sh --quiet $ARGUMENTS`
+!`/Users/brk/.claude/skills/reviewer/review.sh --quiet "$ARGUMENTS"`
 
 ---
 
